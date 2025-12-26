@@ -9,6 +9,19 @@ ADMIN_KUBECONFIG="/etc/kubernetes/admin.conf"
 INSECURE_KUBECONFIG="/root/.kube/config"
 REPORT="/root/kube-bench-report-q02.txt"
 
+wait_for_api() {
+  local tries="${1:-60}"
+  local sleep_s="${2:-2}"
+  for i in $(seq 1 "${tries}"); do
+    if KUBECONFIG=/etc/kubernetes/admin.conf kubectl get --raw=/readyz >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "${sleep_s}"
+  done
+  return 1
+}
+
+
 ts="$(date +%Y%m%d%H%M%S)"
 backup_dir="/root/cis-q02-backups-${ts}"
 mkdir -p "${backup_dir}"
@@ -21,6 +34,38 @@ for f in "${APISERVER_MANIFEST}" "${INSECURE_KUBECONFIG}"; do
 done
 
 echo
+echo "🧩 Creating an overly-permissive ClusterRoleBinding for system:anonymous..."
+# Apply using admin kubeconfig to ensure it succeeds regardless of current kubectl config
+echo
+echo "⏳ Ensuring API server is reachable before applying RBAC..."
+if ! wait_for_api 60 2; then
+  echo "WARN: API server not ready yet; continuing (RBAC apply will be retried)."
+fi
+
+cat <<'EOF' | KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply --validate=false -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: system-anonymous
+subjects:
+- kind: User
+  name: system:anonymous
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+EOF
+echo "⏳ Verifying ClusterRoleBinding exists (retry up to 30s)..."
+for i in $(seq 1 15); do
+  if KUBECONFIG=/etc/kubernetes/admin.conf kubectl get clusterrolebinding system-anonymous >/dev/null 2>&1; then
+    echo "✅ ClusterRoleBinding system-anonymous is present."
+    break
+  fi
+  sleep 2
+done
+
+
 echo "🧩 Introducing intentional insecure API server configuration..."
 
 if [[ ! -f "${APISERVER_MANIFEST}" ]]; then
@@ -85,22 +130,15 @@ fi
 echo "✅ Insecure kube-apiserver flags applied in ${APISERVER_MANIFEST}"
 
 echo
-echo "🧩 Creating an overly-permissive ClusterRoleBinding for system:anonymous..."
-# Apply using admin kubeconfig to ensure it succeeds regardless of current kubectl config
-cat <<'EOF' | KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f -
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: system-anonymous
-subjects:
-- kind: User
-  name: system:anonymous
-  apiGroup: rbac.authorization.k8s.io
-roleRef:
-  kind: ClusterRole
-  name: cluster-admin
-  apiGroup: rbac.authorization.k8s.io
-EOF
+echo "⏳ Waiting briefly for kube-apiserver static pod to reconcile..."
+if ! wait_for_api 30 2; then
+  echo "WARN: API server not ready yet (this is expected briefly during static pod restart)."
+fi
+
+
+echo
+
+
 
 echo
 echo "🧩 Switching kubectl to an unauthenticated kubeconfig (so kubectl will break after you secure the API server)..."
