@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "🧹 Cleaning up / resetting container immutability lab (Q06)"
+echo "🧹 Cleaning up / resetting container immutability lab (Q06 v2)"
 
 NS="lamp"
 WORKDIR="${HOME}/finer-sunbeam"
@@ -27,4 +27,4 @@ echo
 echo "🧹 Removing simulated report..."
 rm -f "${REPORT}"
 
-echo "✅ Q06 cleanup complete."
+echo "✅ Q06 v2 cleanup complete."

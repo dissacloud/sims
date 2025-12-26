@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "🚀 Setting up container immutability hardening lab (Q06 v1)"
+echo "🚀 Setting up container immutability hardening lab (Q06 v2 — clean-running workload)"
 
 NS="lamp"
 DEPLOY="lamp-deployment"
@@ -41,10 +41,14 @@ spec:
     spec:
       containers:
       - name: web
-        image: nginx:1.25-alpine
+        # Workload chosen to run cleanly with readOnlyRootFilesystem=true and non-root user.
+        image: hashicorp/http-echo:0.2.3
+        args:
+        - "-listen=:8080"
+        - "-text=lamp ok"
         ports:
-        - containerPort: 80
-        # INTENTIONALLY MISSING security hardening for the lab:
+        - containerPort: 8080
+        # INTENTIONALLY NON-COMPLIANT for the lab:
         # - runAsUser: 20000
         # - readOnlyRootFilesystem: true
         # - allowPrivilegeEscalation: false
@@ -85,10 +89,10 @@ EOF
 
 echo
 echo "⏳ Waiting for rollout..."
-kubectl -n "${NS}" rollout status deploy/"${DEPLOY}" --timeout=120s >/dev/null 2>&1 || true
+kubectl -n "${NS}" rollout status deploy/"${DEPLOY}" --timeout=120s
 
 echo
-echo "✅ Q06 lab setup complete."
+echo "✅ Q06 v2 lab setup complete."
 echo "Files:"
 echo "  - Manifest: ${MANIFEST}"
 echo "  - Report:   ${REPORT}"
