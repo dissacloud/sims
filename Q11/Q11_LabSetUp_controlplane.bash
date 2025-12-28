@@ -23,7 +23,7 @@ scp "${SCRIPT_DIR}/Q11_Cleanup_Reset_worker.bash" "${WORKER}:/tmp/Q11_Cleanup_Re
 
 echo
 echo "[2] Executing worker setup"
-ssh "${WORKER}" "chmod +x /tmp/Q11_LabSetUp_worker.bash && sudo KUBELET_TAG=${KUBELET_TAG} /tmp/Q11_LabSetUp_worker.bash"
+ssh "${WORKER}" "chmod +x /tmp/Q11_LabSetUp_worker.bash && sudo KUBELET_TAG=${KUBELET_TAG} bash /tmp/Q11_LabSetUp_worker.bash"
 
 echo
 echo "[3] Waiting for node status"
