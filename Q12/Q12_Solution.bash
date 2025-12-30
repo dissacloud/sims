@@ -1,41 +1,70 @@
 #!/usr/bin/env bash
-# Q12 Solution — Instructions ONLY (no automation)
+# Q12 Solution (instructions) — prints the command sequence to perform the task.
+
+set -euo pipefail
 
 cat <<'EOF'
-Q12 — Expected Solution Steps (CKS-style)
+========================
+Q12 — Suggested Solution
+========================
 
-1) Identify which Alpine image contains:
-     libcrypto3 = 3.1.4-r5
+0) Set context
+-------------
+export NS=alpine
+export DEP=alpine
 
-   Inspect each image directly using bom, for example:
+1) Locate the Pod and list its containers
+----------------------------------------
+kubectl -n $NS get deploy $DEP
+POD="$(kubectl -n $NS get pod -l app=alpine -o jsonpath='{.items[0].metadata.name}')"
+echo "Pod: $POD"
+kubectl -n $NS get pod "$POD" -o jsonpath='{.spec.containers[*].name}{"\n"}'
 
-     bom packages alpine:3.18 | grep libcrypto3
-     bom packages alpine:3.19 | grep libcrypto3
-     bom packages alpine:3.20 | grep libcrypto3
+2) Check libcrypto3 version in each container
+---------------------------------------------
+# Run this for each container name you saw above:
+for c in $(kubectl -n $NS get pod "$POD" -o jsonpath='{.spec.containers[*].name}'); do
+  echo "== $c =="
+  kubectl -n $NS exec "$POD" -c "$c" -- sh -lc 'apk update >/dev/null 2>&1; apk info -v libcrypto3 2>/dev/null || echo "libcrypto3 not installed"'
+done
 
-   Note the image version where libcrypto3 is exactly 3.1.4-r5.
+# Identify which container prints:
+#   libcrypto3-3.1.4-r5
 
-2) Generate an SPDX SBOM for THAT image only:
+3) Generate SPDX for the IDENTIFIED image using bom
+---------------------------------------------------
+# Confirm bom works:
+bom help || true
 
-     bom spdx <alpine-image> > ~/alpine.spdx
+# Determine the IMAGE used by the identified container (replace CONTAINER_NAME):
+CONTAINER_NAME="<REPLACE_WITH_IDENTIFIED_CONTAINER>"
+IMG="$(kubectl -n $NS get deploy $DEP -o jsonpath='{.spec.template.spec.containers[?(@.name=="'"$CONTAINER_NAME"'")].image}')"
+echo "Identified image: $IMG"
 
-   Example:
-     bom spdx alpine:3.19 > ~/alpine.spdx
+# Generate SPDX Tag-Value to ~/alpine.spdx:
+bom spdx "$IMG" > "$HOME/alpine.spdx"
 
-3) Edit the deployment manifest:
+# Validate file:
+test -s "$HOME/alpine.spdx" && head -n 5 "$HOME/alpine.spdx"
 
-     vi ~/alpine-deployment.yaml
+4) Remove the identified container from the Deployment
+------------------------------------------------------
+vi "$HOME/alpine-deployment.yaml"
 
-   Remove ONLY the container that uses the identified Alpine image.
-   Do NOT modify the other containers.
+# Delete ONLY the container block for the identified container.
+# Do NOT change the other containers (names/images/commands).
 
-4) Apply the change:
+kubectl apply -f "$HOME/alpine-deployment.yaml"
+kubectl -n $NS rollout status deploy/$DEP --timeout=180s
 
-     kubectl apply -f ~/alpine-deployment.yaml
+# Confirm only 2 containers remain:
+POD2="$(kubectl -n $NS get pod -l app=alpine -o jsonpath='{.items[0].metadata.name}')"
+kubectl -n $NS get pod "$POD2" -o jsonpath='{.spec.containers[*].name}{"\n"}'
 
-5) Verify:
-   - ~/alpine.spdx exists
-   - Deployment now has exactly TWO containers
-   - Remaining containers are unchanged
-
+5) Quick re-check (remaining containers must NOT be the 3.1.4-r5 one)
+---------------------------------------------------------------------
+for c in $(kubectl -n $NS get pod "$POD2" -o jsonpath='{.spec.containers[*].name}'); do
+  echo "== $c =="
+  kubectl -n $NS exec "$POD2" -c "$c" -- sh -lc 'apk info -v libcrypto3 2>/dev/null || true'
+done
 EOF
