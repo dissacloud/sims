@@ -1,27 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STATE_FILE="/root/.q12_target_version"
-TARGET_VER="$(cat "$STATE_FILE" 2>/dev/null || true)"
-
-if [[ -z "${TARGET_VER}" ]]; then
-  echo "ERROR: Missing ${STATE_FILE}. Re-run the lab setup."
-  exit 2
-fi
+STATE_FILE="/root/.q12_target"
+IFS='|' read -r TARGET_VER TARGET_IMAGE TARGET_CONTAINER < "$STATE_FILE"
 
 cat <<EOF
 == Question 12 ==
 
-Task:
-- In namespace 'alpine', the 'alpine' Deployment runs a Pod with 3 containers.
-- Identify which container/image has: libcrypto3=${TARGET_VER}
-- Use 'bom' to generate an SPDX (tag-value) SBOM for that IMAGE and save it to:
-    ~/alpine.spdx
-- Update the Deployment manifest at:
-    ~/alpine-deployment.yaml
-  and REMOVE the container that uses the identified image (the one with libcrypto3=${TARGET_VER}).
-- Do not modify the remaining containers.
+Namespace: alpine
+Deployment: alpine
+Manifest:   ~/alpine-deployment.yaml
 
-Notes:
-- 'bom' is available (wrapper around syft). Run: bom --help
+Task:
+1) Identify the container/image in the 'alpine' pod that has:
+     libcrypto3=${TARGET_VER}
+   (Hint: it is in container '${TARGET_CONTAINER}' using image '${TARGET_IMAGE}').
+
+2) Generate an SPDX (tag-value) SBOM for THAT IMAGE using 'bom' and save it to:
+     ~/alpine.spdx
+
+3) Edit ~/alpine-deployment.yaml and REMOVE the container that uses that image
+   (the one with libcrypto3=${TARGET_VER}). Leave the other containers unchanged.
+
+Expected tooling:
+- bom version
+- bom packages <IMAGE>
+- bom spdx <IMAGE> > ~/alpine.spdx
 EOF
