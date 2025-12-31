@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NS="confidential"
-FILE="$HOME/nginx-unprivileged.yaml"
-
 echo "== Q13 Cleanup/Reset =="
 
-kubectl delete ns "$NS" --ignore-not-found
+NS="confidential"
+MANIFEST="$HOME/nginx-unprivileged.yaml"
 
-rm -f "$FILE" 2>/dev/null || true
+kubectl -n "$NS" delete deploy nginx-unprivileged --ignore-not-found >/dev/null 2>&1 || true
+kubectl delete ns "$NS" --ignore-not-found >/dev/null 2>&1 || true
 
-echo "✅ Q13 cleaned."
+if [[ -f "$MANIFEST" ]]; then
+  rm -f "$MANIFEST"
+fi
+
+echo "✅ Cleanup complete."

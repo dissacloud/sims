@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
+# Q13 STRICT Grader — restricted PSA compliance + runtime correctness
 set -euo pipefail
 trap '' PIPE
 
 NS="confidential"
 DEP="nginx-unprivileged"
-APP="nginx-unprivileged"
-FILE="$HOME/nginx-unprivileged.yaml"
+APP_LABEL="nginx-unprivileged"
+MANIFEST="$HOME/nginx-unprivileged.yaml"
 
 pass=0; fail=0; warn=0
 results=()
@@ -16,138 +17,132 @@ add_warn(){ results+=("[WARN] $1"$'\n'"       * Reason: $2"$'\n'"       * Remedi
 
 k(){ kubectl "$@"; }
 
-echo "== Q13 STRICT Grader (PSS restricted compliance) =="
+echo "== Q13 STRICT Grader =="
 echo "Date: $(date -Is)"
 echo
 
-# API reachability
-if k get --raw=/readyz >/dev/null 2>&1; then
-  add_pass "API server reachable (/readyz)"
-else
-  add_fail "API server reachable (/readyz)" "API not reachable" "Fix control plane / kube-apiserver first"
-fi
-
-# Namespace exists
 if k get ns "$NS" >/dev/null 2>&1; then
   add_pass "Namespace $NS exists"
 else
-  add_fail "Namespace $NS exists" "Namespace missing" "Re-run lab setup or create namespace"
+  add_fail "Namespace $NS exists" "Namespace missing" "kubectl create ns $NS"
 fi
 
-# PSS restricted labels
-enf="$(k get ns "$NS" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}' 2>/dev/null || true)"
-if [[ "$enf" == "restricted" ]]; then
-  add_pass "Namespace enforces restricted PSS"
+if k get ns "$NS" -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}' 2>/dev/null | grep -qx 'restricted'; then
+  add_pass "Namespace enforces PodSecurity restricted"
 else
-  add_fail "Namespace enforces restricted PSS" "enforce label is '$enf' (expected 'restricted')" \
-    "kubectl label ns $NS pod-security.kubernetes.io/enforce=restricted --overwrite"
+  add_fail "Namespace enforces PodSecurity restricted" "pod-security.kubernetes.io/enforce is not 'restricted'" "kubectl label ns $NS pod-security.kubernetes.io/enforce=restricted --overwrite"
 fi
 
-# Manifest existence
-if [[ -f "$FILE" ]]; then
-  add_pass "Manifest exists at ~/nginx-unprivileged.yaml"
-else
-  add_fail "Manifest exists at ~/nginx-unprivileged.yaml" "File missing" "The task expects you to edit ~/nginx-unprivileged.yaml"
-fi
-
-# Deployment exists
 if k -n "$NS" get deploy "$DEP" >/dev/null 2>&1; then
   add_pass "Deployment $DEP exists"
 else
-  add_fail "Deployment $DEP exists" "Deployment missing" "kubectl -n $NS apply -f ~/nginx-unprivileged.yaml"
+  add_fail "Deployment $DEP exists" "Deployment missing" "kubectl -n $NS apply -f $MANIFEST"
 fi
 
-# Pods Running + Ready
-pods="$(k -n "$NS" get pods -l app="$APP" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
-if [[ "$pods" -ge 1 ]]; then
-  add_pass "At least one pod exists for app=$APP"
+POD="$(k -n "$NS" get pod -l app="$APP_LABEL" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+if [[ -n "$POD" ]]; then
+  add_pass "Pod exists ($POD)"
 else
-  add_fail "At least one pod exists for app=$APP" "No pods found" "kubectl -n $NS get rs,pods; fix admission failures and rollout"
+  if k -n "$NS" get rs -l app="$APP_LABEL" >/dev/null 2>&1; then
+    add_fail "Pod exists" "No pod created; likely still blocked by restricted PSA (see ReplicaSet events)" "Fix securityContext fields in ~/nginx-unprivileged.yaml and re-apply"
+  else
+    add_fail "Pod exists" "No ReplicaSet/Pod found for label app=$APP_LABEL" "kubectl -n $NS get deploy,rs,pods; ensure labels match"
+  fi
 fi
 
-ready="$(k -n "$NS" get pods -l app="$APP" -o jsonpath='{range .items[*]}{.status.containerStatuses[0].ready}{"\n"}{end}' 2>/dev/null | grep -c '^true$' || true)"
-if [[ "$ready" -ge 1 ]]; then
-  add_pass "At least one pod is Ready"
-else
-  add_fail "At least one pod is Ready" "Pods not Ready/Running" \
-    "Fix restricted compliance in the Deployment template and re-apply; then wait for rollout"
+if [[ -n "$POD" ]]; then
+  PHASE="$(k -n "$NS" get pod "$POD" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  READY="$(k -n "$NS" get pod "$POD" -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)"
+  if [[ "$PHASE" == "Running" && "$READY" == "true" ]]; then
+    add_pass "Pod is Running and Ready"
+  else
+    add_fail "Pod is Running and Ready" "Pod phase=$PHASE ready=$READY" "kubectl -n $NS describe pod $POD; fix PSA fields and runtime writable mounts for RO rootfs"
+  fi
 fi
 
-# --- Restricted compliance checks on the Deployment template (authoritative) ---
-jsonpath(){ k -n "$NS" get deploy "$DEP" -o "jsonpath=$1" 2>/dev/null || true; }
+if [[ -n "$POD" ]]; then
+  IMG="$(k -n "$NS" get pod "$POD" -o jsonpath='{.spec.containers[?(@.name=="nginx")].image}' 2>/dev/null || true)"
+  if [[ "$IMG" == "nginxinc/nginx-unprivileged:1.25-alpine" ]]; then
+    add_pass "Uses correct image nginxinc/nginx-unprivileged:1.25-alpine"
+  else
+    add_fail "Uses correct image nginxinc/nginx-unprivileged:1.25-alpine" "Found image='$IMG'" "Set container image to nginxinc/nginx-unprivileged:1.25-alpine"
+  fi
 
-runAsNonRoot="$(jsonpath '{.spec.template.spec.securityContext.runAsNonRoot}')"
-seccompType="$(jsonpath '{.spec.template.spec.securityContext.seccompProfile.type}')"
-
-c_ape="$(jsonpath '{.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation}')"
-c_priv="$(jsonpath '{.spec.template.spec.containers[0].securityContext.privileged}')"
-c_rofs="$(jsonpath '{.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem}')"
-c_drop="$(jsonpath '{.spec.template.spec.containers[0].securityContext.capabilities.drop[*]}')"
-c_runAsUser="$(jsonpath '{.spec.template.spec.containers[0].securityContext.runAsUser}')"
-c_runAsGroup="$(jsonpath '{.spec.template.spec.containers[0].securityContext.runAsGroup}')"
-c_seccomp="$(jsonpath '{.spec.template.spec.containers[0].securityContext.seccompProfile.type}')"
-
-# runAsNonRoot: true either at pod level or container level (restricted expects true effectively)
-if [[ "$runAsNonRoot" == "true" || "$(jsonpath '{.spec.template.spec.containers[0].securityContext.runAsNonRoot}')" == "true" ]]; then
-  add_pass "runAsNonRoot is enabled"
-else
-  add_fail "runAsNonRoot is enabled" "runAsNonRoot not set true (pod or container level)" \
-    "Set spec.template.spec.securityContext.runAsNonRoot: true (or container securityContext)"
+  PORT="$(k -n "$NS" get pod "$POD" -o jsonpath='{.spec.containers[?(@.name=="nginx")].ports[0].containerPort}' 2>/dev/null || true)"
+  if [[ "$PORT" == "8080" ]]; then
+    add_pass "Container port is 8080"
+  else
+    add_fail "Container port is 8080" "Found containerPort='$PORT'" "Set containerPort: 8080"
+  fi
 fi
 
-# allowPrivilegeEscalation: false
-if [[ "$c_ape" == "false" ]]; then
-  add_pass "allowPrivilegeEscalation=false"
-else
-  add_fail "allowPrivilegeEscalation=false" "Value is '$c_ape' (expected false)" \
-    "Set container securityContext.allowPrivilegeEscalation: false"
-fi
+if [[ -n "$POD" ]]; then
+  RUN_AS_NON_ROOT="$(k -n "$NS" get pod "$POD" -o jsonpath='{.spec.securityContext.runAsNonRoot}' 2>/dev/null || true)"
+  SECCOMP="$(k -n "$NS" get pod "$POD" -o jsonpath='{.spec.securityContext.seccompProfile.type}' 2>/dev/null || true)"
 
-# privileged must not be true
-if [[ "$c_priv" != "true" ]]; then
-  add_pass "privileged is not enabled"
-else
-  add_fail "privileged is not enabled" "privileged=true is forbidden under restricted" \
-    "Remove privileged:true (or set privileged:false)"
-fi
+  if [[ "$RUN_AS_NON_ROOT" == "true" ]]; then
+    add_pass "Pod securityContext.runAsNonRoot=true"
+  else
+    add_fail "Pod securityContext.runAsNonRoot=true" "Found runAsNonRoot='$RUN_AS_NON_ROOT'" "Set spec.template.spec.securityContext.runAsNonRoot: true"
+  fi
 
-# capabilities drop ALL
-if echo "$c_drop" | tr ' ' '\n' | grep -qx "ALL"; then
-  add_pass "Capabilities drop includes ALL"
-else
-  add_fail "Capabilities drop includes ALL" "capabilities.drop does not include ALL" \
-    "Set container securityContext.capabilities.drop: [\"ALL\"]"
-fi
+  if [[ "$SECCOMP" == "RuntimeDefault" || "$SECCOMP" == "Localhost" ]]; then
+    add_pass "Pod seccompProfile.type is RuntimeDefault/Localhost"
+  else
+    add_fail "Pod seccompProfile.type is RuntimeDefault/Localhost" "Found seccompProfile.type='$SECCOMP'" "Set spec.template.spec.securityContext.seccompProfile.type: RuntimeDefault"
+  fi
 
-# seccomp must be RuntimeDefault (pod-level or container-level)
-if [[ "$seccompType" == "RuntimeDefault" || "$c_seccomp" == "RuntimeDefault" ]]; then
-  add_pass "seccompProfile RuntimeDefault set"
-else
-  add_fail "seccompProfile RuntimeDefault set" "Missing seccompProfile.type=RuntimeDefault" \
-    "Set spec.template.spec.securityContext.seccompProfile.type: RuntimeDefault"
-fi
+  APE="$(k -n "$NS" get pod "$POD" -o jsonpath='{.spec.containers[?(@.name=="nginx")].securityContext.allowPrivilegeEscalation}' 2>/dev/null || true)"
+  RO="$(k -n "$NS" get pod "$POD" -o jsonpath='{.spec.containers[?(@.name=="nginx")].securityContext.readOnlyRootFilesystem}' 2>/dev/null || true)"
+  RUN_AS_UID="$(k -n "$NS" get pod "$POD" -o jsonpath='{.spec.containers[?(@.name=="nginx")].securityContext.runAsUser}' 2>/dev/null || true)"
+  RUN_AS_GID="$(k -n "$NS" get pod "$POD" -o jsonpath='{.spec.containers[?(@.name=="nginx")].securityContext.runAsGroup}' 2>/dev/null || true)"
+  DROPS="$(k -n "$NS" get pod "$POD" -o jsonpath='{.spec.containers[?(@.name=="nginx")].securityContext.capabilities.drop[*]}' 2>/dev/null || true)"
+  ADDS="$(k -n "$NS" get pod "$POD" -o jsonpath='{.spec.containers[?(@.name=="nginx")].securityContext.capabilities.add[*]}' 2>/dev/null || true)"
 
-# strongly recommended (and commonly required by restricted) to set non-zero UID/GID
-if [[ -n "$c_runAsUser" && "$c_runAsUser" != "0" ]]; then
-  add_pass "runAsUser is non-zero ($c_runAsUser)"
-else
-  add_fail "runAsUser is non-zero" "runAsUser missing or 0" \
-    "Set container securityContext.runAsUser to a non-zero UID (e.g. 10001)"
-fi
+  if [[ "$APE" == "false" ]]; then
+    add_pass "allowPrivilegeEscalation=false"
+  else
+    add_fail "allowPrivilegeEscalation=false" "Found allowPrivilegeEscalation='$APE'" "Set container securityContext.allowPrivilegeEscalation: false"
+  fi
 
-if [[ -n "$c_runAsGroup" && "$c_runAsGroup" != "0" ]]; then
-  add_pass "runAsGroup is non-zero ($c_runAsGroup)"
-else
-  add_fail "runAsGroup is non-zero" "runAsGroup missing or 0" \
-    "Set container securityContext.runAsGroup to a non-zero GID (e.g. 10001)"
-fi
+  if [[ "$RO" == "true" ]]; then
+    add_pass "readOnlyRootFilesystem=true"
+  else
+    add_fail "readOnlyRootFilesystem=true" "Found readOnlyRootFilesystem='$RO'" "Set container securityContext.readOnlyRootFilesystem: true"
+  fi
 
-# optional but good hardening; grader enforces it to be exam-like
-if [[ "$c_rofs" == "true" ]]; then
-  add_pass "readOnlyRootFilesystem=true"
-else
-  add_fail "readOnlyRootFilesystem=true" "Value is '$c_rofs' (expected true)" \
-    "Set container securityContext.readOnlyRootFilesystem: true"
+  if [[ -n "$RUN_AS_UID" && "$RUN_AS_UID" != "0" && -n "$RUN_AS_GID" && "$RUN_AS_GID" != "0" ]]; then
+    add_pass "runAsUser/runAsGroup are non-root (UID=$RUN_AS_UID GID=$RUN_AS_GID)"
+  else
+    add_fail "runAsUser/runAsGroup are non-root" "Found UID='$RUN_AS_UID' GID='$RUN_AS_GID'" "Set container securityContext.runAsUser and runAsGroup to non-zero values (e.g. 101)"
+  fi
+
+  if echo " $DROPS " | grep -q " ALL "; then
+    add_pass "capabilities.drop includes ALL"
+  else
+    add_fail "capabilities.drop includes ALL" "Found drop='$DROPS'" 'Set container securityContext.capabilities.drop: ["ALL"]'
+  fi
+
+  if [[ -n "$ADDS" ]]; then
+    add_fail "No added capabilities" "Found capabilities.add='$ADDS'" 'Remove capabilities.add and keep drop: ["ALL"]'
+  else
+    add_pass "No added capabilities"
+  fi
+
+  TMP_MOUNT="$(k -n "$NS" get pod "$POD" -o jsonpath='{.spec.containers[?(@.name=="nginx")].volumeMounts[?(@.mountPath=="/tmp")].name}' 2>/dev/null || true)"
+  CACHE_MOUNT="$(k -n "$NS" get pod "$POD" -o jsonpath='{.spec.containers[?(@.name=="nginx")].volumeMounts[?(@.mountPath=="/var/cache/nginx")].name}' 2>/dev/null || true)"
+
+  if [[ -n "$TMP_MOUNT" ]]; then
+    add_pass "Writable /tmp mount present (volumeMount name=$TMP_MOUNT)"
+  else
+    add_fail "Writable /tmp mount present" "No volumeMount for /tmp detected" "Add emptyDir volume + mountPath: /tmp"
+  fi
+
+  if [[ -n "$CACHE_MOUNT" ]]; then
+    add_pass "Writable /var/cache/nginx mount present (volumeMount name=$CACHE_MOUNT)"
+  else
+    add_fail "Writable /var/cache/nginx mount present" "No volumeMount for /var/cache/nginx detected" "Add emptyDir volume + mountPath: /var/cache/nginx"
+  fi
 fi
 
 echo

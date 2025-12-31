@@ -18,11 +18,11 @@ Constraints:
 - Do not relax/disable Pod Security Admission.
 - Make the workload compliant (restricted).
 
-Hints (what restricted typically requires):
-- runAsNonRoot: true (and set runAsUser/runAsGroup to a non-zero UID/GID)
-- allowPrivilegeEscalation: false
-- drop ALL Linux capabilities
-- seccompProfile: RuntimeDefault
-- avoid privileged / hostPath / hostNetwork, etc.
+Additional requirement (important):
+- Set readOnlyRootFilesystem: true for nginx.
+- Define writable volumes + mounts for:
+    /tmp
+    /var/cache/nginx
+  (nginx frequently fails at startup if these are not writable when rootfs is read-only)
 
 EOF

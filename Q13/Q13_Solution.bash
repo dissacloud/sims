@@ -5,51 +5,74 @@ cat <<'EOF'
 == Q13 Solution (instructions) ==
 
 Goal:
-Make the Deployment in namespace 'confidential' compliant with the restricted Pod Security Standard,
-then confirm pods are Running/Ready.
+Make the Deployment in namespace 'confidential' compliant with PodSecurity 'restricted' and ensure Pods are Running.
 
-1) Inspect why pods are failing:
-   kubectl -n confidential get rs,pods
-   kubectl -n confidential describe rs -l app=nginx-unprivileged
-   kubectl -n confidential get events --sort-by=.lastTimestamp | tail -n 30
+1) Confirm why Pods aren't being created (PSA block)
+   kubectl -n confidential get rs
+   kubectl -n confidential describe rs -l app=nginx-unprivileged | sed -n '/Events:/,$p'
 
-2) Edit the manifest:
+   You should see violations like:
+   - allowPrivilegeEscalation must be false
+   - capabilities must drop ALL (and no NET_ADMIN add)
+   - runAsNonRoot must be true
+   - seccompProfile must be RuntimeDefault/Localhost
+
+2) Edit the manifest at ~/nginx-unprivileged.yaml
    vi ~/nginx-unprivileged.yaml
 
-   Replace the non-compliant securityContext with a restricted-compliant one, for example:
+   Make these changes:
 
-   spec:
-     template:
-       spec:
-         securityContext:
-           runAsNonRoot: true
-           seccompProfile:
-             type: RuntimeDefault
-         containers:
-         - name: nginx
-           image: nginx:1.25-alpine
-           securityContext:
-             allowPrivilegeEscalation: false
-             readOnlyRootFilesystem: true
-             runAsUser: 10001
-             runAsGroup: 10001
-             capabilities:
-               drop: ["ALL"]
+   Pod-level securityContext (recommended):
+   spec.template.spec.securityContext:
+     runAsNonRoot: true
+     seccompProfile:
+       type: RuntimeDefault
 
-   IMPORTANT:
-   - Remove privileged:true
-   - Do NOT add hostPath/hostNetwork
-   - Keep the Deployment name/namespace the same
+   Container-level securityContext:
+     allowPrivilegeEscalation: false
+     capabilities:
+       drop: ["ALL"]
+     runAsUser: 101
+     runAsGroup: 101
+     readOnlyRootFilesystem: true
 
-3) Apply and wait for rollout:
-   kubectl apply -f ~/nginx-unprivileged.yaml
-   kubectl -n confidential rollout status deploy/nginx-unprivileged --timeout=180s
+   IMPORTANT for readOnlyRootFilesystem:
+   Add emptyDir volumes + mounts to provide writable paths for nginx:
+     /tmp
+     /var/cache/nginx
 
-4) Verify final state:
-   kubectl -n confidential get pods -l app=nginx-unprivileged -o wide
-   kubectl -n confidential describe pod -l app=nginx-unprivileged | egrep -i 'seccomp|runAs|capabil|privilege|escalation|readonly' || true
+   Example snippet (container):
+     volumeMounts:
+     - name: tmp
+       mountPath: /tmp
+     - name: nginx-cache
+       mountPath: /var/cache/nginx
 
-5) Run the strict grader:
-   bash Q13_Grader_Strict.bash
+   Example snippet (pod spec):
+     volumes:
+     - name: tmp
+       emptyDir: {}
+     - name: nginx-cache
+       emptyDir: {}
+
+   Also ensure:
+   - image remains: nginxinc/nginx-unprivileged:1.25-alpine
+   - containerPort remains: 8080
+   - Do NOT add privileged, hostNetwork, hostPID, hostPath, etc.
+
+3) Apply changes
+   kubectl -n confidential apply -f ~/nginx-unprivileged.yaml
+
+4) Verify Pods are created and Running
+   kubectl -n confidential get pods -l app=nginx-unprivileged -w
+
+   If it still fails:
+   - describe the pod:
+     kubectl -n confidential describe pod <pod>
+   - check logs:
+     kubectl -n confidential logs <pod> -c nginx
+
+   Common runtime failure if volumes/mounts missing with readOnlyRootFilesystem:
+   - cannot write to /tmp or /var/cache/nginx
 
 EOF

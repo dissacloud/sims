@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "== Q13 Lab Setup — PSS restricted (confidential namespace) =="
+echo "== Q13 Lab Setup — restricted PSA + nginx-unprivileged (broken by PSA) =="
 
 NS="confidential"
-FILE="$HOME/nginx-unprivileged.yaml"
-BACKUP="/root/cis-q13-backups-$(date +%Y%m%d%H%M%S)"
-mkdir -p "$BACKUP"
+DEP="nginx-unprivileged"
+MANIFEST="$HOME/nginx-unprivileged.yaml"
+BACKUP_DIR="/root/cis-q13-backups-$(date +%Y%m%d%H%M%S)"
+mkdir -p "$BACKUP_DIR"
 
-# Create namespace
-kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create ns "$NS"
+need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing $1"; exit 2; }; }
+need kubectl
 
-# Step A: Create the NON-COMPLIANT deployment first (before enforcing restricted),
-# so the Deployment object exists, then we flip enforcement and force a recreate.
-cat <<'YAML' > "$FILE"
+# [0] Namespace + restricted PSA labels
+kubectl get ns "$NS" >/dev/null 2>&1 || kubectl create ns "$NS" >/dev/null
+kubectl label ns "$NS"   pod-security.kubernetes.io/enforce=restricted   pod-security.kubernetes.io/enforce-version=latest   pod-security.kubernetes.io/warn=restricted   pod-security.kubernetes.io/warn-version=latest   pod-security.kubernetes.io/audit=restricted   pod-security.kubernetes.io/audit-version=latest   --overwrite >/dev/null
+
+# [1] Write the manifest (correct image+port), but intentionally NOT compliant with restricted PSA.
+#     This ensures the ReplicaSet will fail to create pods (exam-style).
+cat > "$MANIFEST" <<'YAML'
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -31,50 +36,39 @@ spec:
       labels:
         app: nginx-unprivileged
     spec:
+      # Intentionally missing restricted-required fields:
+      # - securityContext.runAsNonRoot
+      # - securityContext.seccompProfile
       containers:
       - name: nginx
-        image: nginx:1.25-alpine
+        image: nginxinc/nginx-unprivileged:1.25-alpine
         ports:
-        - containerPort: 80
+        - containerPort: 8080
         securityContext:
-          # Intentionally NON-compliant with restricted:
-          privileged: true
+          # Intentionally violates restricted:
           allowPrivilegeEscalation: true
-          runAsNonRoot: false
           capabilities:
-            add: ["NET_ADMIN"]
+            add:
+            - NET_ADMIN
 YAML
 
-cp -f "$FILE" "$BACKUP/nginx-unprivileged.yaml.original"
+cp -f "$MANIFEST" "$BACKUP_DIR/nginx-unprivileged.yaml.original"
 
-echo "[0] Applying initial (non-compliant) Deployment before enforcement..."
-kubectl apply -f "$FILE" >/dev/null
-
-echo "[1] Waiting briefly for initial pod to appear (best-effort)..."
-sleep 3
-kubectl -n "$NS" get deploy nginx-unprivileged >/dev/null 2>&1 || true
-
-# Step B: Enforce restricted PSS (and audit/warn too, exam-style)
-echo "[2] Enforcing Pod Security Standards: restricted (namespace labels)..."
-kubectl label ns "$NS" \
-  pod-security.kubernetes.io/enforce=restricted \
-  pod-security.kubernetes.io/enforce-version=latest \
-  pod-security.kubernetes.io/audit=restricted \
-  pod-security.kubernetes.io/audit-version=latest \
-  pod-security.kubernetes.io/warn=restricted \
-  pod-security.kubernetes.io/warn-version=latest \
-  --overwrite >/dev/null
-
-# Step C: Force the controller to attempt new pod creation under restricted (should fail)
-echo "[3] Forcing pod recreation under restricted (should become non-running until fixed)..."
-kubectl -n "$NS" delete pod -l app=nginx-unprivileged --ignore-not-found >/dev/null 2>&1 || true
-sleep 2
+# [2] Apply (expected to create Deployment/RS; RS will be blocked from creating Pods by PSA)
+kubectl -n "$NS" apply -f "$MANIFEST" >/dev/null || true
 
 echo
-echo "Manifest to fix: $FILE"
-echo "Backup copy:     $BACKUP/nginx-unprivileged.yaml.original"
+echo "Manifest location:"
+echo "  $MANIFEST"
+echo "Backup copy:"
+echo "  $BACKUP_DIR/nginx-unprivileged.yaml.original"
 echo
-echo "Current status (expected: no ready pods until you fix security context):"
-kubectl -n "$NS" get deploy,rs,pods -l app=nginx-unprivileged -o wide || true
+echo "Expected initial state:"
+echo "  - Deployment/ReplicaSet exists"
+echo "  - ReplicaSet fails to create Pods due to PodSecurity 'restricted' enforcement"
+echo
+echo "Validation commands:"
+echo "  kubectl -n $NS get deploy,rs,pods"
+echo "  kubectl -n $NS describe rs -l app=$DEP | sed -n '/Events:/,\$p'"
 echo
 echo "✅ Q13 environment ready."
