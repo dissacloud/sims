@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "== Q12 Lab Setup v8 — Alpine SBOM (bom) using PUBLIC images =="
+echo "== Q12 Lab Setup v10 — Alpine SBOM (bom) using PUBLIC images (robust libcrypto3 parsing) =="
 
 NS="alpine"
 MANIFEST="$HOME/alpine-deployment.yaml"
@@ -89,32 +89,49 @@ echo "✅ Pod: $POD"
 echo
 
 # -----------------------------
-# [2] Discover libcrypto3 versions and choose a deterministic target
-#     Deterministic rule: pick the HIGHEST version string among containers.
+# [2] Discover libcrypto3 versions + choose deterministic target
+# Rule: pick the HIGHEST version string among containers (sort -V).
+# State file MUST be: <version>|<image>|<container>
 # -----------------------------
 echo "[2] Discovering libcrypto3 versions in each container..."
-declare -A VERS
+
+extract_ver() {
+  # input: a line containing libcrypto3-<ver>
+  # output: <ver> (e.g. 3.1.8-r1)
+  echo "$1" | sed -nE 's/.*libcrypto3-([0-9]+\.[0-9]+\.[0-9]+-r[0-9]+).*/\1/p' | head -n1
+}
+
+declare -A RAW
+declare -A VER
+
 for c in alpine-317 alpine-318 alpine-319; do
-  v="$(kubectl -n "$NS" exec "$POD" -c "$c" -- sh -lc \
-      'apk update >/dev/null 2>&1; apk info -v libcrypto3 2>/dev/null | head -n1' \
-      | tr -d '\r' || true)"
-  # v looks like: libcrypto3-3.1.8-r0
-  if [[ -z "$v" ]]; then
-    echo "ERROR: could not determine libcrypto3 version in container $c"
+  # FIX: Always fetch the FIRST header line beginning with "libcrypto3-"
+  out="$(kubectl -n "$NS" exec "$POD" -c "$c" -- sh -lc \
+    'apk update >/dev/null 2>&1; apk info -a libcrypto3 2>/dev/null | grep -m1 "^libcrypto3-" || true' \
+    | tr -d '\r' || true)"
+
+  if [[ -z "${out}" ]]; then
+    echo "ERROR: could not determine libcrypto3 header line in container $c"
+    echo "Remediation: exec and inspect manually:"
+    echo "  kubectl -n $NS exec $POD -c $c -- sh -lc 'apk info -a libcrypto3 | head -n 30'"
     exit 2
   fi
-  VERS["$c"]="$v"
-  echo "  $c => $v"
+
+  v="$(extract_ver "$out")"
+  if [[ -z "${v}" ]]; then
+    echo "ERROR: could not parse libcrypto3 version from: '$out' (container $c)"
+    exit 2
+  fi
+
+  RAW["$c"]="$out"
+  VER["$c"]="$v"
+  echo "  $c => ${out}   (parsed: ${v})"
 done
 
-# Extract just the version part (e.g. 3.1.8-r0)
-extract_ver(){ echo "$1" | sed -E 's/^libcrypto3-([0-9]+\.[0-9]+\.[0-9]+-r[0-9]+).*$/\1/'; }
-
 best_c="alpine-317"
-best_ver="$(extract_ver "${VERS[$best_c]}")"
+best_ver="${VER[$best_c]}"
 for c in alpine-318 alpine-319; do
-  cv="$(extract_ver "${VERS[$c]}")"
-  # sort -V gives correct semantic-ish ordering for these strings
+  cv="${VER[$c]}"
   top="$(printf "%s\n%s\n" "$best_ver" "$cv" | sort -V | tail -n1)"
   if [[ "$top" == "$cv" ]]; then
     best_ver="$cv"
@@ -122,19 +139,21 @@ for c in alpine-318 alpine-319; do
   fi
 done
 
-# Map container -> image
 TARGET_IMAGE="$(kubectl -n "$NS" get pod "$POD" -o jsonpath="{.spec.containers[?(@.name=='$best_c')].image}")"
+
 echo
 echo "✅ Target selected (highest libcrypto3):"
 echo "  Container: $best_c"
 echo "  Image:     $TARGET_IMAGE"
 echo "  Version:   $best_ver"
+echo
 
 printf "%s|%s|%s\n" "$best_ver" "$TARGET_IMAGE" "$best_c" > "$STATE_FILE"
 chmod 600 "$STATE_FILE"
 
+echo "Wrote target state: $STATE_FILE"
+echo "  $(cat "$STATE_FILE")"
 echo
 echo "Manifest location: $MANIFEST"
 echo "Backup copy:       $BACKUP_DIR/alpine-deployment.yaml.original"
-echo "Target state:      $STATE_FILE"
 echo "✅ Q12 environment ready"
