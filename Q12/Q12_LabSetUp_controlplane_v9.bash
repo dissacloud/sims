@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "== Q12 Lab Setup v9 — Alpine SBOM (bom) using PUBLIC images (fixed .q12_target) =="
+echo "== Q12 Lab Setup v10 — Alpine SBOM (bom) using PUBLIC images (robust libcrypto3 parsing) =="
 
 NS="alpine"
 MANIFEST="$HOME/alpine-deployment.yaml"
@@ -89,15 +89,12 @@ echo "✅ Pod: $POD"
 echo
 
 # -----------------------------
-# [2] Discover libcrypto3 versions and choose deterministic target
-#     Deterministic rule: pick the HIGHEST version string among containers.
-#     IMPORTANT: We store ONLY the version part in /root/.q12_target (e.g. 3.1.8-r1)
+# [2] Discover libcrypto3 versions + choose deterministic target
+# Rule: pick the HIGHEST version string among containers (sort -V).
+# State file MUST be: <version>|<image>|<container>
 # -----------------------------
 echo "[2] Discovering libcrypto3 versions in each container..."
 
-# Extract just the version part from possible outputs:
-# - libcrypto3-3.1.8-r1
-# - libcrypto3-3.1.8-r1 description:   (if user runs apk info -a)
 extract_ver() {
   # input: a line containing libcrypto3-<ver>
   # output: <ver> (e.g. 3.1.8-r1)
@@ -108,13 +105,15 @@ declare -A RAW
 declare -A VER
 
 for c in alpine-317 alpine-318 alpine-319; do
-  # Use apk info -v to stay on one-line "pkg-ver" format; less ambiguity than -a
+  # FIX: Always fetch the FIRST header line beginning with "libcrypto3-"
   out="$(kubectl -n "$NS" exec "$POD" -c "$c" -- sh -lc \
-      'apk update >/dev/null 2>&1; apk info -v libcrypto3 2>/dev/null | head -n1' \
-      | tr -d '\r' || true)"
+    'apk update >/dev/null 2>&1; apk info -a libcrypto3 2>/dev/null | grep -m1 "^libcrypto3-" || true' \
+    | tr -d '\r' || true)"
 
   if [[ -z "${out}" ]]; then
-    echo "ERROR: could not determine libcrypto3 version in container $c"
+    echo "ERROR: could not determine libcrypto3 header line in container $c"
+    echo "Remediation: exec and inspect manually:"
+    echo "  kubectl -n $NS exec $POD -c $c -- sh -lc 'apk info -a libcrypto3 | head -n 30'"
     exit 2
   fi
 
@@ -149,14 +148,12 @@ echo "  Image:     $TARGET_IMAGE"
 echo "  Version:   $best_ver"
 echo
 
-# State file MUST be: <version>|<image>|<container>
 printf "%s|%s|%s\n" "$best_ver" "$TARGET_IMAGE" "$best_c" > "$STATE_FILE"
 chmod 600 "$STATE_FILE"
 
 echo "Wrote target state: $STATE_FILE"
 echo "  $(cat "$STATE_FILE")"
 echo
-
 echo "Manifest location: $MANIFEST"
 echo "Backup copy:       $BACKUP_DIR/alpine-deployment.yaml.original"
 echo "✅ Q12 environment ready"
