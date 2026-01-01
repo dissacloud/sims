@@ -69,6 +69,10 @@ chmod 600 "${STATE_FILE}"
 
 echo "[1] Adding 'developer' to docker group (intentional insecure state)..."
 usermod -aG docker developer
+echo "[1.1] docker group now:"
+getent group docker || true
+echo "[1.2] developer identity:"
+id developer || true
 
 echo "[2] Ensuring Docker daemon listens on TCP 2375 and socket group is docker..."
 mkdir -p /etc/docker

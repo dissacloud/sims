@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Q14 STRICT Grader v3 — aligned to solution steps
+# Q14 STRICT Grader v4 — aligned to solution steps (fixed)
 #
 # Verifies (on the TARGET node):
 # 1) user 'developer' exists and is NOT a member of group 'docker'
-# 2) Docker is NOT listening on any TCP port
+# 2) Docker is NOT listening on any TCP port (explicitly checks 2375/2376)
 # 3) /var/run/docker.sock is owned by group 'root'
 # 4) Kubernetes cluster health (nodes Ready)
 
@@ -21,7 +21,7 @@ add_warn(){ results+=("[WARN] $1"$'\n'"       * Reason: $2"$'\n'"       * Remedi
 
 k(){ kubectl "$@"; }
 
-echo "== Q14 STRICT Grader v3 =="
+echo "== Q14 STRICT Grader v4 =="
 echo "Date: $(date -Is)"
 echo
 
@@ -58,7 +58,7 @@ if [[ -z "${TARGET_NODE:-}" ]]; then
   echo "== Summary =="; echo "${pass} PASS"; echo "${warn} WARN"; echo "${fail} FAIL"; exit 1
 fi
 
-SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5"
+SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5"
 
 # --- Step 1: developer exists and not in docker group ---
 if ssh $SSH_OPTS "${TARGET_NODE}" "getent passwd developer" >/dev/null 2>&1; then
@@ -72,7 +72,8 @@ if [[ -z "$DOCKER_GROUP_LINE" ]]; then
   add_warn "docker group exists" "group 'docker' not found" "If Docker is installed, group should exist; otherwise install Docker"
 else
   add_pass "docker group exists"
-  if echo "$DOCKER_GROUP_LINE" | grep -qE '(^|:)developer(,|$)'; then
+  # FIX: correct delimiter-aware membership check for getent output: docker:x:<gid>:member1,member2
+  if echo "$DOCKER_GROUP_LINE" | grep -qE '(^|[,:])developer([,:]|$)'; then
     add_fail "developer removed from docker group" "developer still appears in: $DOCKER_GROUP_LINE" "Run on ${TARGET_NODE}: sudo gpasswd -d developer docker"
   else
     add_pass "developer removed from docker group"
@@ -88,16 +89,17 @@ else
   if [[ "$SOCK_GRP" == "root" ]]; then
     add_pass "docker.sock group is root"
   else
-    add_fail "docker.sock group is root" "docker.sock group is '$SOCK_GRP' ($SOCK_STAT)" "Configure docker.socket to use SocketGroup=root and restart docker.socket"
+    add_fail "docker.sock group is root" "docker.sock group is '$SOCK_GRP' ($SOCK_STAT)" "Set SocketGroup=root in docker.socket or remove daemon.json \"group\": \"docker\"; then restart docker/docker.socket"
   fi
 fi
 
-# --- Step 3: dockerd not listening on TCP ---
-LISTEN_TCP="$(ssh $SSH_OPTS "${TARGET_NODE}" "ss -lntp 2>/dev/null | awk 'NR>1{print \$4" "\$6}' | grep -iE 'dockerd' || true" 2>/dev/null || true)"
-if [[ -z "$LISTEN_TCP" ]]; then
-  add_pass "Docker not listening on TCP"
+# --- Step 3: dockerd not listening on TCP (explicit ports) ---
+# FIX: check port binding itself (2375/2376), not process string
+LISTEN_2375="$(ssh $SSH_OPTS "${TARGET_NODE}" "ss -lnt 2>/dev/null | awk '{print \$4}' | grep -E ':(2375|2376)\$' || true" 2>/dev/null || true)"
+if [[ -z "$LISTEN_2375" ]]; then
+  add_pass "Docker not listening on TCP (2375/2376)"
 else
-  add_fail "Docker not listening on TCP" "dockerd appears to be listening: $LISTEN_TCP" "Remove tcp hosts from /etc/docker/daemon.json and any systemd overrides; then restart docker"
+  add_fail "Docker not listening on TCP (2375/2376)" "Found listeners: $(echo "$LISTEN_2375" | xargs)" "Remove tcp hosts from /etc/docker/daemon.json and any systemd overrides; then restart docker"
 fi
 
 echo
