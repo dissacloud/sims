@@ -3,59 +3,82 @@ set -euo pipefail
 
 WORKER="${WORKER:-node01}"
 
-echo "== Lab setup (Q14): install Docker on ${WORKER} and inject misconfigurations =="
+echo "== Q14 Lab Setup (forces fd:// path + traps) on ${WORKER} =="
 
 ssh -o StrictHostKeyChecking=no "${WORKER}" "sudo bash -s" <<'EOS'
 set -euo pipefail
 
-echo "[0/7] OS info"
-cat /etc/os-release | sed -n '1,10p'
+echo "[1/10] Ensure baseline users/groups exist"
+id developer >/dev/null 2>&1 || useradd -m -s /bin/bash developer
+id ops >/dev/null 2>&1 || useradd -m -s /bin/bash ops
 
-echo "[1/7] Ensure user 'developer' exists"
-id developer >/dev/null 2>&1 || sudo useradd -m -s /bin/bash developer
+getent group docker >/dev/null 2>&1 || groupadd docker
 
-echo "[2/7] Install Docker if missing"
+# TRAP: another user (ops) is also in docker group; removing them should fail grading
+usermod -aG docker developer
+usermod -aG docker ops
+
+echo "[2/10] Install Docker if missing (Ubuntu repo docker.io)"
 if ! command -v docker >/dev/null 2>&1; then
-  echo "Docker not present. Installing docker.io from Ubuntu repos..."
-  sudo apt-get update -y
-  sudo apt-get install -y docker.io
-  sudo systemctl enable --now docker
-else
-  echo "Docker already installed."
-  sudo systemctl enable --now docker || true
+  apt-get update -y
+  apt-get install -y docker.io
 fi
+systemctl enable --now docker
 
-echo "[3/7] Ensure group 'docker' exists"
-getent group docker >/dev/null 2>&1 || sudo groupadd docker
-
-echo "[4/7] Add developer to docker group (vulnerable baseline)"
-sudo usermod -aG docker developer
-
-echo "[5/7] Write vulnerable /etc/docker/daemon.json (tcp + group docker)"
-sudo mkdir -p /etc/docker
-sudo tee /etc/docker/daemon.json >/dev/null <<'JSON'
+echo "[3/10] Create a decoy config file (TRAP: editing this does nothing)"
+mkdir -p /etc/docker
+cat >/etc/docker/daemon.decoy.json <<'JSON'
 {
-  "hosts": ["unix:///var/run/docker.sock", "tcp://0.0.0.0:2375"],
+  "hosts": ["tcp://0.0.0.0:2375"],
   "group": "docker"
 }
 JSON
+chmod 0644 /etc/docker/daemon.decoy.json
 
-echo "[6/7] Remove any systemd override (so daemon.json takes effect)"
-sudo rm -f /etc/systemd/system/docker.service.d/override.conf
-sudo rmdir /etc/systemd/system/docker.service.d 2>/dev/null || true
+echo "[4/10] Create the real daemon.json (NO hosts; group docker)"
+# Real file must not define 'hosts' to keep docker running with fd://
+cat >/etc/docker/daemon.json <<'JSON'
+{
+  "group": "docker"
+}
+JSON
+chmod 0644 /etc/docker/daemon.json
 
-echo "[7/7] Restart docker"
-sudo systemctl daemon-reload
-sudo systemctl restart docker
+echo "[5/10] Force docker ExecStart to include fd:// + insecure TCP via systemd override"
+mkdir -p /etc/systemd/system/docker.service.d
 
-echo
-echo "[INFO] Current vulnerable state:"
-echo "- developer groups: $(id -nG developer)"
-echo "- docker.sock: $(ls -l /var/run/docker.sock || true)"
-echo "- listeners:"
-sudo ss -lntp | grep -E ':2375|dockerd' || true
+# We explicitly include -H fd:// (to force the fd:// decision gate)
+# And we intentionally include -H tcp://0.0.0.0:2375 to create the insecure exposure to remove.
+cat >/etc/systemd/system/docker.service.d/10-cks-q14-tcp.conf <<'INI'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/dockerd -H fd:// -H tcp://0.0.0.0:2375 --containerd=/run/containerd/containerd.sock
+INI
+chmod 0644 /etc/systemd/system/docker.service.d/10-cks-q14-tcp.conf
+
+echo "[6/10] Ensure docker.socket is enabled (used by fd://)"
+systemctl enable --now docker.socket
+
+echo "[7/10] Restart Docker to apply override"
+systemctl daemon-reload
+systemctl restart docker
+
+echo "[8/10] Show forced decision gate (fd:// present)"
+systemctl cat docker | sed -n '1,140p' | grep -E 'ExecStart|fd://|tcp://|docker\.service\.d' || true
+
+echo "[9/10] Show current vulnerable state"
+echo "developer groups: $(id -nG developer)"
+echo "ops groups:       $(id -nG ops)"
+echo "daemon.json:"
+cat /etc/docker/daemon.json
+echo "docker.sock:"
+ls -l /var/run/docker.sock || true
+echo "listeners (expect :2375 open):"
+ss -lntp | grep -E ':2375|dockerd' || true
+
+echo "[10/10] Done"
 EOS
 
 echo
-echo "== Lab setup complete =="
-echo "Next: solve manually, then run ./grader.sh"
+echo "Lab setup complete."
+echo "Run: ./question.sh"

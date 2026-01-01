@@ -3,48 +3,68 @@ set -euo pipefail
 
 WORKER="${WORKER:-node01}"
 
-echo "== Reset Q14: restore vulnerable baseline on ${WORKER} =="
+echo "== Reset: restore vulnerable baseline (fd:// + TCP via systemd; group docker) on ${WORKER} =="
 
 ssh -o StrictHostKeyChecking=no "${WORKER}" "sudo bash -s" <<'EOS'
 set -euo pipefail
 
-# Ensure developer exists
-id developer >/dev/null 2>&1 || sudo useradd -m -s /bin/bash developer
+# Ensure users/groups exist
+id developer >/dev/null 2>&1 || useradd -m -s /bin/bash developer
+id ops >/dev/null 2>&1 || useradd -m -s /bin/bash ops
+getent group docker >/dev/null 2>&1 || groupadd docker
 
-# Ensure Docker installed/running
+# Put both users back into docker group (trap preserved)
+usermod -aG docker developer
+usermod -aG docker ops
+
+# Ensure docker installed/running
 if ! command -v docker >/dev/null 2>&1; then
-  sudo apt-get update -y
-  sudo apt-get install -y docker.io
-  sudo systemctl enable --now docker
+  apt-get update -y
+  apt-get install -y docker.io
 fi
+systemctl enable --now docker
+systemctl enable --now docker.socket
 
-# Ensure docker group exists
-getent group docker >/dev/null 2>&1 || sudo groupadd docker
-
-# Put developer back into docker group
-sudo usermod -aG docker developer
-
-# Remove override so daemon.json controls listeners
-sudo rm -f /etc/systemd/system/docker.service.d/override.conf
-sudo rmdir /etc/systemd/system/docker.service.d 2>/dev/null || true
-
-# Vulnerable daemon.json
-sudo mkdir -p /etc/docker
-sudo tee /etc/docker/daemon.json >/dev/null <<'JSON'
+# Restore real daemon.json (no hosts; group docker)
+mkdir -p /etc/docker
+cat >/etc/docker/daemon.json <<'JSON'
 {
-  "hosts": ["unix:///var/run/docker.sock", "tcp://0.0.0.0:2375"],
   "group": "docker"
 }
 JSON
+chmod 0644 /etc/docker/daemon.json
 
-sudo systemctl daemon-reload
-sudo systemctl restart docker
+# Restore decoy (trap)
+cat >/etc/docker/daemon.decoy.json <<'JSON'
+{
+  "hosts": ["tcp://0.0.0.0:2375"],
+  "group": "docker"
+}
+JSON
+chmod 0644 /etc/docker/daemon.decoy.json
+
+# Restore systemd override that forces fd:// + TCP
+mkdir -p /etc/systemd/system/docker.service.d
+cat >/etc/systemd/system/docker.service.d/10-cks-q14-tcp.conf <<'INI'
+[Service]
+ExecStart=
+ExecStart=/usr/bin/dockerd -H fd:// -H tcp://0.0.0.0:2375 --containerd=/run/containerd/containerd.sock
+INI
+chmod 0644 /etc/systemd/system/docker.service.d/10-cks-q14-tcp.conf
+
+systemctl daemon-reload
+systemctl restart docker
 
 echo "[INFO] Reset state:"
 echo "- developer groups: $(id -nG developer)"
-echo "- docker.sock: $(ls -l /var/run/docker.sock || true)"
-echo "- listeners:"
-sudo ss -lntp | grep -E ':2375|dockerd' || true
+echo "- ops groups:       $(id -nG ops)"
+echo "- daemon.json:"
+cat /etc/docker/daemon.json
+echo "- docker ExecStart (should show fd:// and tcp://):"
+systemctl cat docker | grep -E 'ExecStart|fd://|tcp://' || true
+echo "- listeners (should show :2375):"
+ss -lntp | grep -E ':2375|dockerd' || true
 EOS
 
-echo "== Reset complete =="
+echo "Reset complete."
+echo "Run: ./question.sh"
