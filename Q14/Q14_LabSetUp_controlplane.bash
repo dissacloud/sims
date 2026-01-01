@@ -1,79 +1,68 @@
 #!/usr/bin/env bash
-# Q14 Lab Setup (controlplane orchestrator)
-# Creates an insecure Docker configuration on a worker node to simulate the exam task:
-# - user 'developer' is in docker group
-# - /var/run/docker.sock group is 'docker' (not root)
-# - dockerd listens on a TCP port (2375)
+# Q14 Lab Setup — controlplane orchestrator
 #
-# Usage:
-#   bash Q14_LabSetUp_controlplane.bash
-#   WORKER=node01 bash Q14_LabSetUp_controlplane.bash
+# Creates intentionally insecure Docker settings on the TARGET node for Question 14.
 #
+# Run on: controlplane
+# Writes: /root/.q14_target  (TARGET_NODE=<name>)
+#
+# Optional:
+#   TARGET_NODE=<nodeName> to pin the target selection.
+
 set -euo pipefail
 trap '' PIPE
 
 export KUBECONFIG="${KUBECONFIG:-/etc/kubernetes/admin.conf}"
+TARGET_FILE="/root/.q14_target"
 
-WORKER_NODE="${WORKER:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-need(){ command -v "$1" >/dev/null 2>&1 || { echo "ERROR: missing $1"; exit 2; }; }
-need kubectl
-need ssh
-need scp
 
 echo "== Q14 Lab Setup (controlplane) =="
 echo "Date: $(date -Is)"
-echo "Script dir: ${SCRIPT_DIR}"
-echo
+echo "KUBECONFIG: $KUBECONFIG"
 
-# Auto-detect a non-control-plane node if WORKER not set
-if [[ -z "${WORKER_NODE}" ]]; then
-  WORKER_NODE="$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.labels.node-role\.kubernetes\.io/control-plane}{"\n"}{end}'     | awk '$2=="" {print $1}' | head -n1 || true)"
+# --- Select target node ---
+if [[ -n "${TARGET_NODE:-}" ]]; then
+  WORKER="$TARGET_NODE"
+else
+  # pick the first node that is NOT labelled as control-plane
+  WORKER="$(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.labels.node-role\.kubernetes\.io/control-plane}{"\n"}{end}' \
+    | awk '$2==""{print $1; exit 0}')"
 fi
 
-if [[ -z "${WORKER_NODE}" ]]; then
-  echo "ERROR: Could not auto-detect a worker node."
-  echo "Remediation: set WORKER explicitly, e.g. WORKER=node01 bash $0"
+if [[ -z "${WORKER:-}" ]]; then
+  echo "ERROR: Could not auto-detect a worker node. Set TARGET_NODE explicitly." >&2
   exit 2
 fi
 
-echo "Worker node selected: ${WORKER_NODE}"
-echo
+echo "Target node (cks000037): $WORKER"
 
-# Ensure local worker scripts exist
-for f in Q14_LabSetUp_worker.bash Q14_Cleanup_Reset_worker.bash; do
-  if [[ ! -f "${SCRIPT_DIR}/${f}" ]]; then
-    echo "ERROR: missing ${SCRIPT_DIR}/${f}"
-    exit 2
+# Persist target for grader/cleanup
+printf 'TARGET_NODE=%s\n' "$WORKER" | sudo tee "$TARGET_FILE" >/dev/null
+sudo chmod 600 "$TARGET_FILE"
+
+# Sanity: if developer is accidentally present on controlplane docker group, remove it
+# to avoid confusion when testing.
+if getent group docker >/dev/null 2>&1; then
+  if getent group docker | grep -qE '(^|,)developer(,|$)'; then
+    echo "[info] Removing 'developer' from docker group on controlplane (hygiene)..."
+    sudo gpasswd -d developer docker >/dev/null 2>&1 || true
   fi
-done
-
-# Check SSH connectivity (non-interactive if possible)
-if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${WORKER_NODE}" "true" >/dev/null 2>&1; then
-  echo "✅ SSH connectivity to ${WORKER_NODE} confirmed (BatchMode)."
-else
-  echo "⚠️  Cannot SSH to ${WORKER_NODE} in BatchMode (passwordless SSH likely not configured)."
-  echo
-  echo "Fallback manual steps:"
-  echo "  scp ${SCRIPT_DIR}/Q14_LabSetUp_worker.bash ${WORKER_NODE}:/tmp/Q14_LabSetUp_worker.bash"
-  echo "  scp ${SCRIPT_DIR}/Q14_Cleanup_Reset_worker.bash ${WORKER_NODE}:/tmp/Q14_Cleanup_Reset_worker.bash"
-  echo "  ssh ${WORKER_NODE}"
-  echo "  sudo bash /tmp/Q14_LabSetUp_worker.bash"
-  exit 3
 fi
 
-echo "[1] Copying worker setup + cleanup scripts to worker..."
-scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${SCRIPT_DIR}/Q14_LabSetUp_worker.bash" "${WORKER_NODE}:/tmp/Q14_LabSetUp_worker.bash" >/dev/null
-scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${SCRIPT_DIR}/Q14_Cleanup_Reset_worker.bash" "${WORKER_NODE}:/tmp/Q14_Cleanup_Reset_worker.bash" >/dev/null
-echo "✅ Copied."
-echo
+# --- Copy + execute worker setup ---
+echo "[1] Testing SSH connectivity to $WORKER..."
+ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "$WORKER" "echo SSH_OK: $(hostname)" >/dev/null
 
-echo "[2] Executing worker setup (sudo bash)..."
-ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "${WORKER_NODE}" "chmod +x /tmp/Q14_LabSetUp_worker.bash && sudo bash /tmp/Q14_LabSetUp_worker.bash"
-echo
+echo "[2] Copying worker setup script..."
+scp -o StrictHostKeyChecking=accept-new "$SCRIPT_DIR/Q14_LabSetUp_worker.bash" "$WORKER:/tmp/Q14_LabSetUp_worker.bash" >/dev/null
 
-echo "[3] Cluster sanity check..."
-kubectl get nodes -o wide
+echo "[3] Executing worker setup (sudo bash)..."
+ssh -o StrictHostKeyChecking=accept-new "$WORKER" "sudo bash /tmp/Q14_LabSetUp_worker.bash" 
+
 echo
-echo "✅ Q14 lab environment ready. Target node is '${WORKER_NODE}'."
+echo "[4] Verification (target node):"
+ssh -o StrictHostKeyChecking=accept-new "$WORKER" "set -e; echo '--- docker group ---'; getent group docker || true; echo '--- developer ---'; id developer 2>/dev/null || echo 'developer missing'; echo '--- docker.sock ---'; ls -l /var/run/docker.sock 2>/dev/null || true; echo '--- dockerd TCP listeners ---'; ss -lntp 2>/dev/null | grep -E '(:2375\b|dockerd)' || true" || true
+
+echo
+echo "✅ Q14 lab environment ready. Target node recorded in $TARGET_FILE"
