@@ -3,37 +3,64 @@ set -euo pipefail
 
 NS="${NS:-mtls}"
 DECOY_NS="${DECOY_NS:-mtls-decoy}"
+MISLEAD_NS="${MISLEAD_NS:-mtls1}"
+
+# Choose an Istio version that is known-stable for labs.
+# You can override at runtime: ISTIO_VERSION=1.22.3 bash labsetup.sh
+ISTIO_VERSION="${ISTIO_VERSION:-1.22.3}"
 
 echo "== Q15 Lab Setup (Istio L4 mTLS strict) =="
 echo "Target namespace: ${NS}"
 echo "Decoy namespace:  ${DECOY_NS}"
+echo "Istio version:    ${ISTIO_VERSION}"
 
-# 0) Ensure Istio exists (best-effort)
-if ! kubectl get ns istio-system >/dev/null 2>&1; then
-  echo "[WARN] istio-system namespace not found. Attempting best-effort Istio install..."
-  ISTIOCTL=""
-  if command -v istioctl >/dev/null 2>&1; then
-    ISTIOCTL="istioctl"
-  else
-    # Try common locations
-    for p in /root/istio*/bin/istioctl /opt/istio*/bin/istioctl /usr/local/bin/istioctl; do
-      if [ -x "$p" ]; then ISTIOCTL="$p"; break; fi
-    done
+ensure_istio() {
+  if kubectl get ns istio-system >/dev/null 2>&1; then
+    echo "[OK] istio-system already exists"
+    return 0
   fi
 
-  if [ -n "$ISTIOCTL" ]; then
-    echo "[INFO] Using istioctl: $ISTIOCTL"
-    $ISTIOCTL install -y --set profile=demo >/dev/null
-  else
-    echo "[ERROR] istioctl not found and istio-system missing. This sim requires Istio installed." >&2
-    echo "Install Istio in this environment, then re-run ./labsetup.sh" >&2
+  echo "[WARN] istio-system namespace not found. Installing Istio..."
+
+  # Ensure curl exists
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "[INFO] curl not found; installing..."
+    sudo apt-get update -y >/dev/null
+    sudo apt-get install -y curl >/dev/null
+  fi
+
+  # Download Istio (includes istioctl)
+  # This uses the official Istio download script.
+  # If outbound egress is blocked in your lab, this will fail.
+  echo "[INFO] Downloading Istio ${ISTIO_VERSION}..."
+  curl -fsSL https://istio.io/downloadIstio | ISTIO_VERSION="${ISTIO_VERSION}" sh - >/dev/null
+
+  local ISTIO_DIR="istio-${ISTIO_VERSION}"
+  if [ ! -d "${ISTIO_DIR}" ]; then
+    echo "[ERROR] Istio directory ${ISTIO_DIR} not found after download." >&2
     exit 2
   fi
-fi
+
+  export PATH="$PWD/${ISTIO_DIR}/bin:$PATH"
+
+  if ! command -v istioctl >/dev/null 2>&1; then
+    echo "[ERROR] istioctl not available after download. Check PATH." >&2
+    exit 2
+  fi
+
+  echo "[INFO] Installing Istio control plane (demo profile)..."
+  istioctl install -y --set profile=demo >/dev/null
+
+  echo "[INFO] Waiting for istiod..."
+  kubectl -n istio-system rollout status deploy/istiod --timeout=180s >/dev/null
+
+  echo "[OK] Istio installed"
+}
+
+ensure_istio
 
 echo "[1] Verify Istio control plane (istiod) exists"
-kubectl -n istio-system get pods >/dev/null
-kubectl -n istio-system get deploy istiod >/dev/null 2>&1 || true
+kubectl -n istio-system get pods
 
 # 2) Create target namespace (mtls) with injection DISABLED initially
 kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}" >/dev/null
@@ -47,13 +74,11 @@ kubectl get ns "${DECOY_NS}" >/dev/null 2>&1 || kubectl create ns "${DECOY_NS}" 
 kubectl label ns "${DECOY_NS}" istio-injection=enabled --overwrite >/dev/null
 
 # TRAP: Another “looks-correct” namespace name variant (common mistake)
-# People sometimes create "mTLS" (invalid) or "mtls " etc; here we create a misleading similar name.
-MISLEAD_NS="mtls1"
 kubectl get ns "${MISLEAD_NS}" >/dev/null 2>&1 || kubectl create ns "${MISLEAD_NS}" >/dev/null
 kubectl label ns "${MISLEAD_NS}" istio-injection=enabled --overwrite >/dev/null
 
 # 3) Deploy simple TCP server + client in the TARGET namespace (without sidecars)
-cat <<'EOF' | kubectl -n "${NS}" apply -f -
+cat <<EOF | kubectl -n "${NS}" apply -f -
 apiVersion: v1
 kind: Service
 metadata:
@@ -86,7 +111,6 @@ spec:
         command: ["/bin/sh","-lc"]
         args:
           - |
-            # TCP echo using socat
             apk add --no-cache socat >/dev/null 2>&1 || true
             while true; do socat -v TCP-LISTEN:9000,reuseaddr,fork EXEC:'/bin/cat'; done
         ports:
@@ -112,7 +136,6 @@ spec:
         command: ["/bin/sh","-lc"]
         args:
           - |
-            # Keep pod alive; user may exec to test
             sleep 365d
 EOF
 
@@ -141,8 +164,8 @@ spec:
 EOF
 
 echo "[5] Wait for pods"
-kubectl -n "${NS}" rollout status deploy/tcp-echo --timeout=180s >/dev/null
-kubectl -n "${NS}" rollout status deploy/tcp-client --timeout=180s >/dev/null
+kubectl -n "${NS}" rollout status deploy/tcp-echo --timeout=180s
+kubectl -n "${NS}" rollout status deploy/tcp-client --timeout=180s
 
 echo
 echo "== Lab state summary =="

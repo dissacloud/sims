@@ -7,6 +7,12 @@ MISLEAD_NS="${MISLEAD_NS:-mtls1}"
 
 echo "== Reset Q15 to vulnerable/broken baseline =="
 
+# Ensure Istio exists (CRDs + istio-system namespace). Reset assumes labsetup already installed it.
+kubectl get ns istio-system >/dev/null 2>&1 || {
+  echo "[ERROR] istio-system missing. Run ./labsetup.sh first (it installs Istio)." >&2
+  exit 2
+}
+
 # Ensure namespaces exist
 kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}" >/dev/null
 kubectl get ns "${DECOY_NS}" >/dev/null 2>&1 || kubectl create ns "${DECOY_NS}" >/dev/null
