@@ -15,6 +15,8 @@ WEBHOOK_KUBECONFIG="/etc/kubernetes/bouncer/imagepolicywebhook.kubeconfig"
 ADMIN_KUBECONFIG="/etc/kubernetes/admin.conf"
 VULN_MANIFEST="${HOME}/vulnerable.yaml"
 SCANNER_URL="https://smooth-yak.local/review"
+BOUNCER_DIR="/etc/kubernetes/bouncer"
+
 
 pass=0; fail=0; warn=0
 results=()
@@ -36,6 +38,16 @@ else
     "Run this grader on the kubeadm control-plane node"
 fi
 
+# Optional: confirm apiserver is up (prevents confusing downstream failures)
+if KUBECONFIG="${ADMIN_KUBECONFIG}" kubectl get --raw='/readyz' >/dev/null 2>&1; then
+  add_pass "APISERVER readyz endpoint reachable"
+else
+  add_fail "APISERVER readyz endpoint reachable" \
+    "API server not ready; kubectl may fail" \
+    "Fix kube-apiserver static pod (flags + mounts) and wait for it to become ready"
+fi
+
+
 # 2) admission-control-config-file points to provided config
 if grep -qE -- "--admission-control-config-file(=| )${ADMISSION_CFG}" "${APISERVER_MANIFEST}" 2>/dev/null; then
   add_pass "APISERVER admission-control-config-file configured"
@@ -55,6 +67,26 @@ else
     "ImagePolicyWebhook not present in '${val:-missing}'" \
     "Add ImagePolicyWebhook to --enable-admission-plugins"
 fi
+
+# 3.5) kube-apiserver must mount /etc/kubernetes/bouncer into the container (hostPath + volumeMount)
+# Without this, apiserver cannot read admission-control-config-file and will crashloop, breaking kubectl.
+
+if grep -qE -- "path:\s*${BOUNCER_DIR}(\s|$)" "${APISERVER_MANIFEST}" 2>/dev/null; then
+  add_pass "APISERVER hostPath volume for bouncer present (${BOUNCER_DIR})"
+else
+  add_fail "APISERVER hostPath volume for bouncer present (${BOUNCER_DIR})" \
+    "No hostPath volume found for ${BOUNCER_DIR}" \
+    "Add a volume under spec.volumes: hostPath.path: ${BOUNCER_DIR} (DirectoryOrCreate recommended)"
+fi
+
+if grep -qE -- "mountPath:\s*${BOUNCER_DIR}(\s|$)" "${APISERVER_MANIFEST}" 2>/dev/null; then
+  add_pass "APISERVER volumeMount for bouncer present (${BOUNCER_DIR})"
+else
+  add_fail "APISERVER volumeMount for bouncer present (${BOUNCER_DIR})" \
+    "No volumeMount found for ${BOUNCER_DIR}" \
+    "Add a volumeMount under kube-apiserver container: mountPath: ${BOUNCER_DIR} (readOnly: true recommended)"
+fi
+
 
 # 4) AdmissionConfiguration fields
 if [[ -f "${ADMISSION_CFG}" ]]; then

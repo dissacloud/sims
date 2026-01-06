@@ -29,6 +29,39 @@ kubectl -n kube-system get pods | grep kube-apiserver
 kubectl -n kube-system describe pod <kube-apiserver-pod> | grep -E "admission-control-config-file|enable-admission-plugins"
 ```
 
+## 1.3) CRITICAL: mount /etc/kubernetes/bouncer into the apiserver container
+
+Because kube-apiserver runs as a container, it must have access to the host directory:
+/etc/kubernetes/bouncer (AdmissionConfiguration + kubeconfig live here).
+
+Add under spec.volumes::
+
+```
+- name: bouncer
+  hostPath:
+    path: /etc/kubernetes/bouncer
+    type: DirectoryOrCreate
+```
+```
+Add under spec.containers[0].volumeMounts::
+
+- name: bouncer
+  mountPath: /etc/kubernetes/bouncer
+  readOnly: true
+```
+Save; kubelet will restart the API server static pod automatically.
+
+## 1.4) Wait until the API server is ready (grader-aligned)
+```
+KUBECONFIG=/etc/kubernetes/admin.conf kubectl get --raw='/readyz'
+```
+
+If not ready, inspect apiserver logs:
+```
+kubectl -n kube-system logs -l component=kube-apiserver --tail=80
+```
+
+
 ## 2) Configure ImagePolicyWebhook to deny on backend failure
 Edit:
 ```bash
@@ -52,6 +85,13 @@ clusters:
   cluster:
     server: https://smooth-yak.local/review
 ```
+
+Quick confirm:
+
+```
+grep -n "server:" /etc/kubernetes/bouncer/imagepolicywebhook.kubeconfig
+```
+
 
 ## 4) Test — vulnerable workload should be denied
 ```bash
