@@ -25,4 +25,4 @@ Notes
 - The cluster may mention Docker for troubleshooting. Use whatever runtime tooling exists in your environment.
 
 
-chmod +x Q07v2_Questions.bash
+

@@ -84,4 +84,4 @@ echo "ℹ️ kube-apiserver will be restarted automatically by kubelet due to ma
 echo "   Validate when ready: KUBECONFIG=${ADMIN_KUBECONFIG} kubectl get --raw=/readyz"
 
 
-chmod +x Q07v2_LabSetUp_controlplane.bash
+# chmod +x Q07v2_LabSetUp_controlplane.bash

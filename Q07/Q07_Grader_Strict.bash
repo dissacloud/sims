@@ -114,4 +114,4 @@ echo "${fail} checks FAIL"
 exit $([[ "${fail}" -eq 0 ]] && echo 0 || echo 2)
 
 
-chmod +x Q07v2_Grader_Strict.bash
+

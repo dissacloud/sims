@@ -47,6 +47,21 @@ sudo touch "${LOG_FILE}"
 sudo chmod 600 "${LOG_FILE}"
 sudo truncate -s 0 "${LOG_FILE}" || true
 
+# WAIT HERE — before any kubectl usage
+wait_for_apiserver() {
+  echo "[INFO] Waiting for kube-apiserver to become ready..."
+  for i in {1..60}; do
+    if KUBECONFIG=/etc/kubernetes/admin.conf kubectl get --raw='/readyz' >/dev/null 2>&1; then
+      echo "[INFO] kube-apiserver is ready"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "[ERROR] kube-apiserver did not become ready in time" >&2
+  exit 1
+}
+
+
 # Ensure webapps namespace exists (grader will generate actions against it)
 KUBECONFIG=/etc/kubernetes/admin.conf kubectl get ns webapps >/dev/null 2>&1 || \
   KUBECONFIG=/etc/kubernetes/admin.conf kubectl create ns webapps >/dev/null
