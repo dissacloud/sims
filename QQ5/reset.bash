@@ -6,29 +6,29 @@ HOST_DEVMEM="/opt/lab/devmem"
 
 log(){ echo "[reset] $*"; }
 
-log "Deleting namespace '${NS}' (removes all lab resources)"
-if kubectl get ns "${NS}" >/dev/null 2>&1; then
-  kubectl delete ns "${NS}" --wait=true
-else
-  log "Namespace '${NS}' not present — nothing to delete"
-fi
+delete_devmem_on_node() {
+  local node="$1"
+  local cmd="
+set -euo pipefail
+sudo rm -f '${HOST_DEVMEM}' || true
+sudo rmdir /opt/lab 2>/dev/null || true
+"
 
-log "Removing simulated host /dev/mem file"
-if sudo test -f "${HOST_DEVMEM}"; then
-  sudo rm -f "${HOST_DEVMEM}"
-  log "Removed ${HOST_DEVMEM}"
-else
-  log "Host file ${HOST_DEVMEM} not present"
-fi
+  if [[ "$node" == "controlplane" || "$node" == "$(hostname)" ]]; then
+    bash -lc "$cmd"
+  else
+    ssh -o StrictHostKeyChecking=no "$node" "bash -lc $(printf %q "$cmd")"
+  fi
+}
 
-log "Removing empty lab directory (if unused)"
-if sudo test -d "/opt/lab"; then
-  sudo rmdir /opt/lab 2>/dev/null || true
-fi
+log "Deleting namespace '${NS}'"
+kubectl get ns "${NS}" >/dev/null 2>&1 && kubectl delete ns "${NS}" --wait=true || true
 
-log "Reset complete. Environment is back to pre-lab state."
+log "Removing simulated /opt/lab/devmem from all nodes"
+delete_devmem_on_node "controlplane"
+mapfile -t nodes < <(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+for n in "${nodes[@]:-}"; do
+  [[ -n "$n" ]] && delete_devmem_on_node "$n"
+done
 
-echo
-echo "Verification (should show nothing lab-related):"
-kubectl get ns | grep -E "^ai" || echo "✓ namespace ai absent"
-sudo test -f "${HOST_DEVMEM}" || echo "✓ /opt/lab/devmem absent"
+log "Reset complete (pre-lab state)."

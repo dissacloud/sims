@@ -4,7 +4,7 @@ set -euo pipefail
 NS="ai"
 DEP_BAD="ollama"
 DEP_GOOD="helper"
-HOST_DEVMEM="/opt/lab/devmem"   # host file that will be mounted as /dev/mem inside container
+HOST_DEVMEM="/opt/lab/devmem"   # host file to mount into container at /dev/mem
 
 log(){ echo "[labsetup] $*"; }
 
@@ -12,44 +12,100 @@ ensure_docker() {
   log "Ensuring Docker Engine is installed and running..."
 
   if ! command -v docker >/dev/null 2>&1; then
-    log "Docker not found. Installing docker.io (Debian/Ubuntu)..."
+    log "Docker not found. Installing docker.io..."
     sudo apt-get update -y
     sudo apt-get install -y docker.io
   else
     log "Docker binary detected."
   fi
 
-  # Start/enable (systemd-based environments)
   if command -v systemctl >/dev/null 2>&1; then
     sudo systemctl enable docker >/dev/null 2>&1 || true
-    sudo systemctl start docker >/dev/null 2>&1 || true
+    sudo systemctl start docker  >/dev/null 2>&1 || true
   else
-    # Fallback start (non-systemd)
     sudo service docker start >/dev/null 2>&1 || true
   fi
 
-  # Verify docker daemon responds
   if ! sudo docker info >/dev/null 2>&1; then
-    log "ERROR: Docker daemon is not responding."
-    log "Try: sudo systemctl status docker --no-pager  (or sudo service docker status)"
+    log "ERROR: Docker daemon not responding (sudo docker info failed)."
     exit 1
   fi
 
-  log "Docker is running: $(sudo docker version --format '{{.Server.Version}}' 2>/dev/null || echo 'ok')"
+  log "Docker is running."
+}
+
+detect_k8s_runtime() {
+  local runtime="unknown"
+  if command -v crictl >/dev/null 2>&1; then
+    runtime="$(crictl info 2>/dev/null | grep -E '"runtimeType"|runtimeType' -m1 || true)"
+  fi
+  log "Kubernetes runtime hint: ${runtime:-unknown} (docker may not show k8s containers if runtime != docker)"
+}
+
+# Ensure /opt/lab/devmem exists as a FILE on a given node.
+# If the path exists as a directory (or anything else), remove it and recreate as a file.
+ensure_devmem_on_node() {
+  local node="$1"
+  local path="$HOST_DEVMEM"
+  local dir
+  dir="$(dirname "$path")"
+
+  local cmd="
+set -euo pipefail
+sudo mkdir -p '$dir'
+if sudo test -d '$path'; then
+  # If someone created it as a directory, remove it so we can recreate as a file
+  sudo rm -rf '$path'
+fi
+# If it's missing or not a regular file, recreate it deterministically
+if ! sudo test -f '$path'; then
+  echo 'SIMULATED_KERNEL_MEMORY_DO_NOT_READ' | sudo tee '$path' >/dev/null
+fi
+sudo chmod 600 '$path'
+sudo test -f '$path'
+"
+
+  if [[ "$node" == "controlplane" || "$node" == "$(hostname)" ]]; then
+    log "Ensuring ${path} is a file on local node (${node})"
+    bash -lc "$cmd"
+  else
+    log "Ensuring ${path} is a file on remote node (${node})"
+    ssh -o StrictHostKeyChecking=no "$node" "bash -lc $(printf %q "$cmd")"
+  fi
+}
+
+ensure_devmem_on_all_nodes() {
+  log "Ensuring simulated /dev/mem exists on ALL nodes (hostPath is node-local)"
+
+  # Ensure on controlplane
+  ensure_devmem_on_node "controlplane"
+
+  # Ensure on all worker nodes (everything except control-plane role)
+  # This is robust even if node names differ from node01.
+  mapfile -t workers < <(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .metadata.labels[*]}{" "}{end}{"\n"}{end}' \
+    | awk '!/node-role.kubernetes.io\/control-plane/ && !/node-role.kubernetes.io\/master/ {print $1}')
+
+  if [[ "${#workers[@]}" -eq 0 ]]; then
+    log "No worker nodes detected; only controlplane present."
+    return 0
+  fi
+
+  for n in "${workers[@]}"; do
+    ensure_devmem_on_node "$n"
+  done
 }
 
 log "Step 0: Ensure Docker is running"
 ensure_docker
+detect_k8s_runtime
 
-log "Step 1: Create namespace: ${NS}"
+log "Step 1: Create namespace ${NS}"
 kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
 
-log "Step 2: Create simulated host /dev/mem file at ${HOST_DEVMEM}"
-sudo mkdir -p "$(dirname "${HOST_DEVMEM}")"
-echo "SIMULATED_KERNEL_MEMORY_DO_NOT_READ" | sudo tee "${HOST_DEVMEM}" >/dev/null
-sudo chmod 600 "${HOST_DEVMEM}"
+log "Step 2: Create simulated host /dev/mem at ${HOST_DEVMEM} (all nodes)"
+ensure_devmem_on_all_nodes
 
-log "Step 3: Create GOOD baseline deployment (${DEP_GOOD})"
+log "Step 3: Create baseline deployment ${DEP_GOOD} (must remain running)"
 cat <<EOF | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
@@ -75,8 +131,7 @@ spec:
           readOnlyRootFilesystem: true
 EOF
 
-log "Step 4: Create MISBEHAVING deployment (${DEP_BAD}) that reads /dev/mem"
-# It mounts a host file into container at /dev/mem and reads it in a loop.
+log "Step 4: Create misbehaving deployment ${DEP_BAD} (reads /dev/mem repeatedly)"
 cat <<EOF | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
@@ -102,7 +157,8 @@ spec:
           - |
             echo "[ollama] starting; simulating /dev/mem read loop";
             while true; do
-              dd if=/dev/mem bs=32 count=1 2>/dev/null | hexdump -C | head -n 1 || true;
+              echo "[ollama] reading /dev/mem...";
+              dd if=/dev/mem bs=16 count=1 2>/dev/null | hexdump -C | head -n 1 || true;
               sleep 2;
             done
         volumeMounts:
@@ -118,15 +174,13 @@ spec:
           type: File
 EOF
 
-log "Step 5: Wait for pods"
-kubectl -n "${NS}" rollout status deploy/"${DEP_GOOD}" --timeout=120s
-kubectl -n "${NS}" rollout status deploy/"${DEP_BAD}" --timeout=120s
+log "Step 5: Wait for rollouts"
+kubectl -n "${NS}" rollout status deploy/"${DEP_GOOD}" --timeout=180s
+kubectl -n "${NS}" rollout status deploy/"${DEP_BAD}" --timeout=180s
 
 echo
-log "Done."
-echo "Check:"
+log "Lab ready."
+echo "Quick checks:"
+echo "  sudo docker info | head -n 5"
 echo "  kubectl -n ${NS} get pods -o wide"
 echo "  kubectl -n ${NS} logs -l app=${DEP_BAD} --tail=10"
-echo
-echo "Docker validation:"
-echo "  sudo docker info | head"
