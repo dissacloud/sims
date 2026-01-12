@@ -20,7 +20,7 @@ Constraints:
 
 \- Do not modify any Deployment configuration except scaling down replicas.
 
-\- Ensure Docker Engine is running (validate with `docker info`).
+\- Ensure Docker Engine is running (validate with `docker info`). (because of this sim u can use crictl instead of docker)
 
 \- The cluster may use containerd; Docker may not list Kubernetes containers. Use Kubernetes resources to identify the Pod/Deployment.
 

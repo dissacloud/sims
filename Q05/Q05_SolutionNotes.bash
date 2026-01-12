@@ -16,6 +16,19 @@ Inspect pod specs for access to `/dev/mem` (look for hostPath /dev/mem or mountP
 kubectl -n ollama get pod <POD> -o yaml | grep -n "/dev/mem" -n
 ```
 
+Confirm the behaviour from logs (you should see repeated “reading /dev/mem” output in this lab):
+```bash
+kubectl -n ollama logs -l app=ollama --tail=30
+```
+or
+
+```bash
+kubectl -n ollama logs <the pods under the namespace> --tail=30
+```
+
+
+
+
 Optional runtime check using docker (container name will vary):
 ```bash
 docker ps | grep ollama

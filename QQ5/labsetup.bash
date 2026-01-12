@@ -4,7 +4,7 @@ set -euo pipefail
 NS="ai"
 DEP_BAD="ollama"
 DEP_GOOD="helper"
-HOST_DEVMEM="/opt/lab/devmem"   # host file to mount into container at /dev/mem
+HOST_DEVMEM="/opt/lab/devmem"
 
 log(){ echo "[labsetup] $*"; }
 
@@ -26,11 +26,7 @@ ensure_docker() {
     sudo service docker start >/dev/null 2>&1 || true
   fi
 
-  if ! sudo docker info >/dev/null 2>&1; then
-    log "ERROR: Docker daemon not responding (sudo docker info failed)."
-    exit 1
-  fi
-
+  sudo docker info >/dev/null 2>&1 || { log "ERROR: Docker daemon not responding"; exit 1; }
   log "Docker is running."
 }
 
@@ -42,8 +38,6 @@ detect_k8s_runtime() {
   log "Kubernetes runtime hint: ${runtime:-unknown} (docker may not show k8s containers if runtime != docker)"
 }
 
-# Ensure /opt/lab/devmem exists as a FILE on a given node.
-# If the path exists as a directory (or anything else), remove it and recreate as a file.
 ensure_devmem_on_node() {
   local node="$1"
   local path="$HOST_DEVMEM"
@@ -53,19 +47,15 @@ ensure_devmem_on_node() {
   local cmd="
 set -euo pipefail
 sudo mkdir -p '$dir'
-if sudo test -d '$path'; then
-  # If someone created it as a directory, remove it so we can recreate as a file
-  sudo rm -rf '$path'
-fi
-# If it's missing or not a regular file, recreate it deterministically
-if ! sudo test -f '$path'; then
-  echo 'SIMULATED_KERNEL_MEMORY_DO_NOT_READ' | sudo tee '$path' >/dev/null
-fi
+# If path exists as directory, remove and recreate as file
+if sudo test -d '$path'; then sudo rm -rf '$path'; fi
+# Create file if missing
+if ! sudo test -f '$path'; then echo 'SIMULATED_KERNEL_MEMORY_DO_NOT_READ' | sudo tee '$path' >/dev/null; fi
 sudo chmod 600 '$path'
 sudo test -f '$path'
 "
 
-  if [[ "$node" == "controlplane" || "$node" == "$(hostname)" ]]; then
+  if [[ "$node" == "$(hostname)" ]]; then
     log "Ensuring ${path} is a file on local node (${node})"
     bash -lc "$cmd"
   else
@@ -76,21 +66,8 @@ sudo test -f '$path'
 
 ensure_devmem_on_all_nodes() {
   log "Ensuring simulated /dev/mem exists on ALL nodes (hostPath is node-local)"
-
-  # Ensure on controlplane
-  ensure_devmem_on_node "controlplane"
-
-  # Ensure on all worker nodes (everything except control-plane role)
-  # This is robust even if node names differ from node01.
-  mapfile -t workers < <(kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{range .metadata.labels[*]}{" "}{end}{"\n"}{end}' \
-    | awk '!/node-role.kubernetes.io\/control-plane/ && !/node-role.kubernetes.io\/master/ {print $1}')
-
-  if [[ "${#workers[@]}" -eq 0 ]]; then
-    log "No worker nodes detected; only controlplane present."
-    return 0
-  fi
-
-  for n in "${workers[@]}"; do
+  mapfile -t nodes < <(kubectl get nodes -o name | sed 's|node/||')
+  for n in "${nodes[@]}"; do
     ensure_devmem_on_node "$n"
   done
 }
@@ -102,10 +79,15 @@ detect_k8s_runtime
 log "Step 1: Create namespace ${NS}"
 kubectl get ns "${NS}" >/dev/null 2>&1 || kubectl create ns "${NS}"
 
+log "Step 1b: Allow privileged workloads in ${NS} (PSA compatibility)"
+kubectl label ns "${NS}" pod-security.kubernetes.io/enforce=privileged --overwrite
+kubectl label ns "${NS}" pod-security.kubernetes.io/audit=privileged --overwrite
+kubectl label ns "${NS}" pod-security.kubernetes.io/warn=privileged --overwrite
+
 log "Step 2: Create simulated host /dev/mem at ${HOST_DEVMEM} (all nodes)"
 ensure_devmem_on_all_nodes
 
-log "Step 3: Create baseline deployment ${DEP_GOOD} (must remain running)"
+log "Step 3: Create baseline deployment ${DEP_GOOD}"
 cat <<EOF | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
@@ -131,7 +113,7 @@ spec:
           readOnlyRootFilesystem: true
 EOF
 
-log "Step 4: Create misbehaving deployment ${DEP_BAD} (reads /dev/mem repeatedly)"
+log "Step 4: Create misbehaving deployment ${DEP_BAD} (forced to controlplane)"
 cat <<EOF | kubectl apply -f -
 apiVersion: apps/v1
 kind: Deployment
@@ -148,6 +130,12 @@ spec:
       labels:
         app: ${DEP_BAD}
     spec:
+      nodeSelector:
+        kubernetes.io/hostname: controlplane
+      tolerations:
+      - key: "node-role.kubernetes.io/control-plane"
+        operator: "Exists"
+        effect: "NoSchedule"
       containers:
       - name: ${DEP_BAD}
         image: busybox:1.36
